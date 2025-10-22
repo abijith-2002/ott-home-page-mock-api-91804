@@ -1,6 +1,7 @@
 from typing import List, Dict
 import os
 import logging
+from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,12 +12,13 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger("uvicorn.error")
 
 # Determine absolute path to images to avoid CWD-related issues
-# When launched from any working directory, this ensures correct resolution:
-# base: <repo>/ott-home-page-mock-api-91804/backend_mock_api
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# src/api -> backend root is two levels up from this file: src/api/ -> src/ -> backend root
-_BACKEND_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
-_IMAGES_DIR = os.path.join(_BACKEND_ROOT, "images")
+# Resolve using pathlib and parents to be robust across environments.
+_THIS_FILE = Path(__file__).resolve()
+_THIS_DIR = _THIS_FILE.parent
+# src/api -> backend root is two levels up from this file: src/api -> src -> backend root
+_BACKEND_ROOT = _THIS_DIR.parents[1]
+_IMAGES_DIR_PATH = _BACKEND_ROOT / "images"
+_IMAGES_DIR = str(_IMAGES_DIR_PATH)
 
 
 def _safe_listdir(path: str) -> list:
@@ -43,9 +45,9 @@ def _find_case_insensitive(root: str, filename: str) -> str | None:
     exact_path = os.path.join(root, filename)
     if os.path.isfile(exact_path):
         return exact_path
-    # Fallback: case-insensitive search
+    # Fallback: case-insensitive search over first 1000 entries to avoid excessive iteration
     lower = filename.lower()
-    for name in _safe_listdir(root):
+    for name in _safe_listdir(root)[:1000]:
         if name.lower() == lower:
             cand = os.path.join(root, name)
             if os.path.isfile(cand):
@@ -65,6 +67,8 @@ def create_app() -> FastAPI:
     - Provides OpenAPI docs metadata and tags.
     - Emits debug logging about the resolved static directory and sample file existence.
     - Exposes diagnostics endpoint to show resolved images_dir and files list.
+    - Adds guaranteed diagnostics at /_health/images and /_debug/images.
+    - Adds passthrough GET /images/{filename:path} with case-insensitive lookup and logging.
 
     Returns:
         FastAPI: Configured FastAPI application.
@@ -365,29 +369,26 @@ def register_routes(app: FastAPI) -> None:
             FileResponse: The requested image file or 404.
         """
         path = _find_case_insensitive(_IMAGES_DIR, filename)
-        logger.debug(f"[Passthrough] Requested filename={filename}, resolved_path={path}")
+        logger.info(f"[MediaPassthrough] request filename={filename} -> resolved={path}")
         if not path:
-            logger.warning(f"[Passthrough] File not found: {os.path.join(_IMAGES_DIR, filename)}")
+            logger.warning(f"[MediaPassthrough] File not found: {os.path.join(_IMAGES_DIR, filename)}")
             raise HTTPException(status_code=404, detail="File not found")
         return FileResponse(path)
 
     # PUBLIC_INTERFACE
     @app.get(
-        "/images/{filename}",
+        "/images/{filename:path}",
         tags=["Media"],
-        summary="Compatibility: Serve image under /images",
-        description="Fallback route to serve images via FileResponse when StaticFiles path mismatch is suspected or clients use /images.",
+        summary="Compatibility: Serve image under /images (case-insensitive)",
+        description="Passthrough route to serve images via FileResponse with case-insensitive lookup. Useful if StaticFiles path mismatch is suspected or clients use /images.",
         responses={
             200: {"description": "The image file will be returned"},
             404: {"description": "File not found"},
         },
     )
-    def images_fallback(filename: str):
+    def images_passthrough(filename: str):
         """
-        Fallback FileResponse server for /images/{filename}.
-
-        This provides an explicit route in case StaticFiles mount is mis-resolved by runtime,
-        or if there is an ingress/proxy rewriting issue causing 404s on static mounts.
+        Passthrough FileResponse server for /images/{filename} with case-insensitive lookup.
 
         Args:
             filename (str): Image filename to serve.
@@ -396,9 +397,9 @@ def register_routes(app: FastAPI) -> None:
             FileResponse: The requested image file, or 404 if missing.
         """
         path = _find_case_insensitive(_IMAGES_DIR, filename)
-        logger.debug(f"[ImagesFallback] filename={filename}, resolved_path={path}")
+        logger.info(f"[ImagesPassthrough] request filename={filename} -> resolved={path}")
         if not path:
-            logger.warning(f"[ImagesFallback] File not found: {os.path.join(_IMAGES_DIR, filename)}")
+            logger.warning(f"[ImagesPassthrough] File not found: {os.path.join(_IMAGES_DIR, filename)}")
             raise HTTPException(status_code=404, detail="File not found")
         return FileResponse(path)
 
@@ -424,16 +425,77 @@ def register_routes(app: FastAPI) -> None:
         if files:
             sample_url = f"{base}/media/{files[0]}"
         payload = {
-            "this_dir": _THIS_DIR,
-            "backend_root": _BACKEND_ROOT,
+            "this_dir": str(_THIS_DIR),
+            "backend_root": str(_BACKEND_ROOT),
             "images_dir": _IMAGES_DIR,
             "images_dir_exists": exists,
             "files_count": len(files),
-            "files": files,
+            "files": files[:50],
             "sample_media_url": sample_url,
             "notes": "Static mounts are available at /media and /images.",
         }
         return JSONResponse(payload)
+
+    # PUBLIC_INTERFACE
+    @app.get(
+        "/_health/images",
+        tags=["Diagnostics"],
+        summary="Health: Images directory",
+        description="Guaranteed diagnostics endpoint. Returns absolute images_dir path, exists flag, first 50 entries, and mounted routes.",
+        responses={200: {"description": "Diagnostics returned"}},
+    )
+    def health_images():
+        """
+        Health endpoint for images directory and routing information.
+
+        Returns:
+            dict: includes resolved images_dir, exists check, listing, and mounted routes.
+        """
+        exists = os.path.isdir(_IMAGES_DIR)
+        files = _safe_listdir(_IMAGES_DIR) if exists else []
+        routes = []
+        # Collect mounted routes info
+        for r in app.router.routes:
+            try:
+                routes.append(getattr(r, "path", str(r)))
+            except Exception:
+                routes.append(str(r))
+        return JSONResponse({
+            "images_dir": _IMAGES_DIR,
+            "images_dir_exists": exists,
+            "list_first_50": files[:50],
+            "mounted_routes": routes,
+        })
+
+    # PUBLIC_INTERFACE
+    @app.get(
+        "/_debug/images",
+        tags=["Diagnostics"],
+        summary="Debug: Images directory",
+        description="Guaranteed diagnostics endpoint. Same as /_health/images for debugging purposes.",
+        responses={200: {"description": "Diagnostics returned"}},
+    )
+    def debug_images():
+        """
+        Debug endpoint for images directory and routing information.
+
+        Returns:
+            dict: includes resolved images_dir, exists check, listing, and mounted routes.
+        """
+        exists = os.path.isdir(_IMAGES_DIR)
+        files = _safe_listdir(_IMAGES_DIR) if exists else []
+        routes = []
+        for r in app.router.routes:
+            try:
+                routes.append(getattr(r, "path", str(r)))
+            except Exception:
+                routes.append(str(r))
+        return JSONResponse({
+            "images_dir": _IMAGES_DIR,
+            "images_dir_exists": exists,
+            "list_first_50": files[:50],
+            "mounted_routes": routes,
+        })
 
 
 # Create global app entrypoint for ASGI servers like uvicorn

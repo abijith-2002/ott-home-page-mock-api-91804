@@ -13,28 +13,49 @@ Docs: http://localhost:3001/docs
 
 ## Static Media
 - Primary static mount: `/media/{filename}`
-- Compatibility mount: `/images/{filename}` (added to support clients requesting `/images/*`)
+- Compatibility static mount: `/images/{filename}`
+- Additionally, a passthrough route exists: `GET /images/{filename}` (case-insensitive) to serve via FileResponse with logs.
 - The app mounts the local folder: `backend_mock_api/images`
-- Static mount is configured with an absolute path resolved from `src/api/main.py`, so it works regardless of current working directory.
+- Static mounts are configured with an absolute path resolved using `Path(__file__).resolve().parents` from `src/api/main.py`, so it works regardless of current working directory.
 
-## Diagnostic Media Endpoints
-- GET `/api/media/exists/{filename}` — returns `{ "exists": true }` if file exists, 404 otherwise.
-- GET `/api/media/{filename}` — direct FileResponse passthrough for debugging (normal usage should prefer `/media/{filename}` served via StaticFiles).
-- GET `/images/{filename}` — fallback FileResponse route for `/images/*` if StaticFiles is mis-resolved by runtime/proxy.
+## Guaranteed Diagnostics Endpoints
+These endpoints always return JSON even if static mounts fail:
+- GET `/_health/images` — returns resolved `images_dir`, `exists` flag, first 50 entries, and mounted routes.
+- GET `/_debug/images` — same as above for debugging.
+- Existing diagnostics:
+  - GET `/api/media/debug` — returns resolved `images_dir` and list of files.
+  - GET `/api/media/exists/{filename}` — returns `{ "exists": true }` if file exists, 404 otherwise.
+  - GET `/api/media/{filename}` — direct FileResponse passthrough for debugging.
 
 ## Verify Static Files (troubleshooting 404)
-1) Check OpenAPI and sample list:
-   - Open logs: the app logs the resolved images directory path and lists a few sample files on startup.
-2) Verify file existence:
+1) Diagnostics:
+   - curl -s http://localhost:3001/_health/images | jq
+   - curl -s http://localhost:3001/_debug/images | jq
+2) Verify file existence (case-insensitive supported):
    - curl -s http://localhost:3001/api/media/exists/bcs.jpg
 3) Fetch via primary static mount:
    - curl -I http://localhost:3001/media/bcs.jpg
-4) Fetch via compatibility mount:
+4) Fetch via compatibility static mount:
    - curl -I http://localhost:3001/images/bcs.jpg
-5) Fetch via explicit passthrough (bypasses StaticFiles):
+5) Fetch via explicit passthrough (bypasses StaticFiles and logs path):
    - curl -I http://localhost:3001/api/media/bcs.jpg
+6) Direct passthrough under /images (case-insensitive and logs path):
+   - curl -I http://localhost:3001/images/Stranger_Things.jpg
 
-If (2) returns exists=true but (3) returns 404, suspect a proxy/ingress static path mismatch; (4) or (5) should succeed and can be used as a fallback.
+If (2) returns exists=true but (3) returns 404, suspect a proxy/ingress static path mismatch; (4), (5), or (6) should succeed and can be used as a fallback.
+
+## Known Working URLs (examples)
+- Stranger Things via /media:
+  - http://localhost:3001/media/stranger_things.jpg
+- Stranger Things via /images (static mount):
+  - http://localhost:3001/images/stranger_things.jpg
+- Stranger Things via passthrough (case-insensitive):
+  - http://localhost:3001/images/Stranger_Things.jpg
+  - http://localhost:3001/api/media/stranger_things.jpg
+- Diagnostics:
+  - http://localhost:3001/_health/images
+  - http://localhost:3001/_debug/images
+  - http://localhost:3001/api/media/debug
 
 ## Endpoints
 - GET `/`                      - Health check
@@ -58,4 +79,4 @@ curl -s http://localhost:3001/api/trending | jq
 - CORS is permissive for local testing.
 - Poster URLs use the request's scheme and host to avoid hard-coding domains. We strip trailing slash from `request.base_url` to ensure correct concatenation (`https://host/media/file.jpg`).
 - The OpenAPI documentation includes tags and response models for clarity.
-- If you previously used a different static path, note: primary route is `/media/{filename}` and images live in `backend_mock_api/images`. For compatibility, `/images/{filename}` is also available.
+- Primary route is `/media/{filename}` and images live in `backend_mock_api/images`. For compatibility, `/images/{filename}` (static) and `GET /images/{filename}` (passthrough) are also available.
