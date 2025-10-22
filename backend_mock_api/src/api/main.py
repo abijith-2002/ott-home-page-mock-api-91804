@@ -4,7 +4,7 @@ import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 # Setup module logger
@@ -19,6 +19,40 @@ _BACKEND_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 _IMAGES_DIR = os.path.join(_BACKEND_ROOT, "images")
 
 
+def _safe_listdir(path: str) -> list:
+    """Utility to list a directory safely, returning [] on error and logging issues."""
+    try:
+        return sorted(os.listdir(path))
+    except Exception as e:
+        logger.warning(f"[Static] Could not list dir {path}: {e}")
+        return []
+
+
+def _find_case_insensitive(root: str, filename: str) -> str | None:
+    """
+    Resolve a filename under root in a case-insensitive manner.
+    If an exact match exists, return it. Otherwise try to match ignoring case.
+
+    Args:
+        root (str): Root directory
+        filename (str): Requested filename
+
+    Returns:
+        str | None: Absolute path if found, else None
+    """
+    exact_path = os.path.join(root, filename)
+    if os.path.isfile(exact_path):
+        return exact_path
+    # Fallback: case-insensitive search
+    lower = filename.lower()
+    for name in _safe_listdir(root):
+        if name.lower() == lower:
+            cand = os.path.join(root, name)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
 # PUBLIC_INTERFACE
 def create_app() -> FastAPI:
     """
@@ -30,6 +64,7 @@ def create_app() -> FastAPI:
     - Registers API routes under / and /api/*.
     - Provides OpenAPI docs metadata and tags.
     - Emits debug logging about the resolved static directory and sample file existence.
+    - Exposes diagnostics endpoint to show resolved images_dir and files list.
 
     Returns:
         FastAPI: Configured FastAPI application.
@@ -42,6 +77,7 @@ def create_app() -> FastAPI:
             {"name": "Health", "description": "Service status and metadata."},
             {"name": "Media", "description": "Static media files."},
             {"name": "Catalog", "description": "Mock endpoints for various content categories."},
+            {"name": "Diagnostics", "description": "Runtime diagnostics and environment info."},
         ],
     )
 
@@ -50,18 +86,13 @@ def create_app() -> FastAPI:
     logger.info(f"[Static] _BACKEND_ROOT={_BACKEND_ROOT}")
     logger.info(f"[Static] _IMAGES_DIR={_IMAGES_DIR}")
     logger.info(f"[Static] images dir exists? {os.path.isdir(_IMAGES_DIR)}")
-    try:
-        sample_list = sorted(os.listdir(_IMAGES_DIR))[:3] if os.path.isdir(_IMAGES_DIR) else []
-    except Exception as e:
-        sample_list = []
-        logger.warning(f"[Static] Could not list images dir: {e}")
+    sample_list = _safe_listdir(_IMAGES_DIR)[:5] if os.path.isdir(_IMAGES_DIR) else []
     logger.info(f"[Static] sample files: {sample_list}")
 
     # Mount static images directory using an absolute path for reliability
+    # Mount at both /media and /images for maximum compatibility with frontends.
+    # Using absolute path ensures consistency across different working directories / process managers.
     app.mount("/media", StaticFiles(directory=_IMAGES_DIR), name="media")
-
-    # Also mount under /images as a compatibility route if clients request /images/*
-    # This addresses persistent 404s when frontend expects '/images'.
     app.mount("/images", StaticFiles(directory=_IMAGES_DIR), name="images")
 
     # Permissive CORS for local testing
@@ -86,6 +117,9 @@ class ShowItem(BaseModel):
 def _build_base_url(request: Request) -> str:
     """
     Build a base URL based on the incoming request, ensuring it matches the current host and scheme.
+
+    We avoid forcing any host rewriting (e.g., with X-Forwarded-*), letting the ASGI server / proxy provide
+    the correct base_url. Trailing slash is stripped for clean concatenation.
 
     Args:
         request (Request): The FastAPI request object.
@@ -304,9 +338,9 @@ def register_routes(app: FastAPI) -> None:
         Returns:
             dict: {'exists': True} if found, otherwise 404.
         """
-        path = os.path.join(_IMAGES_DIR, filename)
-        if os.path.isfile(path):
-            return {"exists": True}
+        path = _find_case_insensitive(_IMAGES_DIR, filename)
+        if path:
+            return {"exists": True, "resolved": os.path.basename(path)}
         raise HTTPException(status_code=404, detail="File not found")
 
     # PUBLIC_INTERFACE
@@ -330,10 +364,10 @@ def register_routes(app: FastAPI) -> None:
         Returns:
             FileResponse: The requested image file or 404.
         """
-        path = os.path.join(_IMAGES_DIR, filename)
+        path = _find_case_insensitive(_IMAGES_DIR, filename)
         logger.debug(f"[Passthrough] Requested filename={filename}, resolved_path={path}")
-        if not os.path.isfile(path):
-            logger.warning(f"[Passthrough] File not found: {path}")
+        if not path:
+            logger.warning(f"[Passthrough] File not found: {os.path.join(_IMAGES_DIR, filename)}")
             raise HTTPException(status_code=404, detail="File not found")
         return FileResponse(path)
 
@@ -361,12 +395,45 @@ def register_routes(app: FastAPI) -> None:
         Returns:
             FileResponse: The requested image file, or 404 if missing.
         """
-        path = os.path.join(_IMAGES_DIR, filename)
+        path = _find_case_insensitive(_IMAGES_DIR, filename)
         logger.debug(f"[ImagesFallback] filename={filename}, resolved_path={path}")
-        if not os.path.isfile(path):
-            logger.warning(f"[ImagesFallback] File not found: {path}")
+        if not path:
+            logger.warning(f"[ImagesFallback] File not found: {os.path.join(_IMAGES_DIR, filename)}")
             raise HTTPException(status_code=404, detail="File not found")
         return FileResponse(path)
+
+    # PUBLIC_INTERFACE
+    @app.get(
+        "/api/media/debug",
+        tags=["Diagnostics"],
+        summary="Media directory diagnostics",
+        description="Returns the resolved absolute images directory path and lists available files.",
+        responses={200: {"description": "Diagnostics returned"}},
+    )
+    def media_debug(request: Request):
+        """
+        Expose diagnostics for the resolved images directory and available files.
+
+        Returns:
+            dict: path info and filenames
+        """
+        base = _build_base_url(request)
+        exists = os.path.isdir(_IMAGES_DIR)
+        files = _safe_listdir(_IMAGES_DIR) if exists else []
+        sample_url = None
+        if files:
+            sample_url = f"{base}/media/{files[0]}"
+        payload = {
+            "this_dir": _THIS_DIR,
+            "backend_root": _BACKEND_ROOT,
+            "images_dir": _IMAGES_DIR,
+            "images_dir_exists": exists,
+            "files_count": len(files),
+            "files": files,
+            "sample_media_url": sample_url,
+            "notes": "Static mounts are available at /media and /images.",
+        }
+        return JSONResponse(payload)
 
 
 # Create global app entrypoint for ASGI servers like uvicorn
