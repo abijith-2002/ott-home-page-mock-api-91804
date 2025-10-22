@@ -1,1 +1,3 @@
-# ott-home-page-mock-api-91804
+# Project Repository
+
+This is the initial README file for the project.
