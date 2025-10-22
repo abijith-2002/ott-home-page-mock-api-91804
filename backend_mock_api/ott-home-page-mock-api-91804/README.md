@@ -12,18 +12,23 @@ From the backend root:
 Docs: http://localhost:3001/docs
 
 ## Static Media
-- Images are served from: /media/{filename}
-- The app mounts the local folder: backend_mock_api/images
+- Images are served from: `/media/{filename}`
+- The app mounts the local folder: `backend_mock_api/images`
+- Static mount is configured with an absolute path resolved from `src/api/main.py`, so it works regardless of current working directory.
+
+## Diagnostic Media Endpoints
+- GET `/api/media/exists/{filename}` — returns `{ "exists": true }` if file exists, 404 otherwise.
+- GET `/api/media/{filename}` — direct FileResponse passthrough for debugging (normal usage should prefer `/media/{filename}` served via StaticFiles).
 
 ## Endpoints
-- GET /                      - Health check
-- GET /api/trending          - Trending shows
-- GET /api/continue_watching - Continue watching
-- GET /api/action            - Action shows
-- GET /api/family            - Family shows
-- GET /api/comedy            - Comedy shows
-- GET /api/horror            - Horror shows
-- GET /api/drama             - Drama shows
+- GET `/`                      - Health check
+- GET `/api/trending`          - Trending shows
+- GET `/api/continue_watching` - Continue watching
+- GET `/api/action`            - Action shows
+- GET `/api/family`            - Family shows
+- GET `/api/comedy`            - Comedy shows
+- GET `/api/horror`            - Horror shows
+- GET `/api/drama`             - Drama shows
 
 All endpoints return an array of objects:
 [
@@ -35,5 +40,6 @@ curl -s http://localhost:3001/api/trending | jq
 
 ## Notes
 - CORS is permissive for local testing.
-- Poster URLs use the request's scheme and host to avoid hard-coding domains.
+- Poster URLs use the request's scheme and host to avoid hard-coding domains. We strip trailing slash from `request.base_url` to ensure correct concatenation (`https://host/media/file.jpg`).
 - The OpenAPI documentation includes tags and response models for clarity.
+- If you previously used a different static path, note that the correct route is `/media/{filename}` and images live in `backend_mock_api/images`.

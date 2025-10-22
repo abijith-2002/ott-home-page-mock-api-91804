@@ -1,8 +1,19 @@
 from typing import List, Dict
-from fastapi import FastAPI, Request
+import os
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+
+# Determine absolute path to images to avoid CWD-related issues
+# When launched from any working directory, this ensures correct resolution:
+# base: <repo>/ott-home-page-mock-api-91804/backend_mock_api
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+# src/api -> backend root is two levels up from this file: src/api/ -> src/ -> backend root
+_BACKEND_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
+_IMAGES_DIR = os.path.join(_BACKEND_ROOT, "images")
+
 
 # PUBLIC_INTERFACE
 def create_app() -> FastAPI:
@@ -28,10 +39,8 @@ def create_app() -> FastAPI:
         ],
     )
 
-    # Mount static images directory
-    # The images directory exists at backend_mock_api/images relative to project root.
-    # At runtime, CWD is typically backend_mock_api, so "images" resolves correctly.
-    app.mount("/media", StaticFiles(directory="images"), name="media")
+    # Mount static images directory using an absolute path for reliability
+    app.mount("/media", StaticFiles(directory=_IMAGES_DIR), name="media")
 
     # Permissive CORS for local testing
     app.add_middleware(
@@ -245,6 +254,58 @@ def register_routes(app: FastAPI) -> None:
     )
     def get_drama(request: Request) -> List[ShowItem]:
         return _build_items(DATA["drama"], request)
+
+    # PUBLIC_INTERFACE
+    @app.get(
+        "/api/media/exists/{filename}",
+        tags=["Media"],
+        summary="Check if media file exists",
+        description="Returns 200 if the requested media file exists in the images directory, 404 otherwise.",
+        responses={
+            200: {"description": "File exists"},
+            404: {"description": "File not found"},
+        },
+    )
+    def media_exists(filename: str):
+        """
+        Health check for media files existence.
+
+        Args:
+            filename (str): Image filename to check (e.g., 'bcs.jpg').
+
+        Returns:
+            dict: {'exists': True} if found, otherwise 404.
+        """
+        path = os.path.join(_IMAGES_DIR, filename)
+        if os.path.isfile(path):
+            return {"exists": True}
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # PUBLIC_INTERFACE
+    @app.get(
+        "/api/media/{filename}",
+        tags=["Media"],
+        summary="Serve media file (explicit passthrough)",
+        description="Explicit passthrough route to serve a media file. Normally, static files are served from /media/{filename}. This route is for diagnostics.",
+        responses={
+            200: {"description": "The media file will be returned"},
+            404: {"description": "File not found"},
+        },
+    )
+    def media_passthrough(filename: str):
+        """
+        Serve a media file directly via FileResponse for debugging.
+
+        Args:
+            filename (str): Image filename to serve.
+
+        Returns:
+            FileResponse: The requested image file or 404.
+        """
+        path = os.path.join(_IMAGES_DIR, filename)
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(path)
 
 
 # Create global app entrypoint for ASGI servers like uvicorn
