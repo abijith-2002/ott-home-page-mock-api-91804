@@ -5,7 +5,9 @@ from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
+# Note: ProxyHeadersMiddleware import path varies across environments.
+# We avoid it here to prevent import errors and rely on FastAPI's root_path
+# and reverse proxy configuration instead.
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -70,7 +72,7 @@ def create_app() -> FastAPI:
     Create and configure the FastAPI application instance.
 
     Proxy and path base support:
-    - Honors X-Forwarded-Proto and X-Forwarded-Prefix via ProxyHeadersMiddleware.
+    - Honors proxy path base via FastAPI(root_path=APP_ROOT_PATH).
     - Supports configurable root path via env APP_ROOT_PATH (e.g., "/", "/backend").
     - Optionally configures TrustedHostMiddleware via TRUSTED_HOSTS env.
 
@@ -102,8 +104,10 @@ def create_app() -> FastAPI:
         ],
     )
 
-    # Proxy headers: respect X-Forwarded-Proto and X-Forwarded-Prefix from upstream proxy
-    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+    # Proxy headers: In some environments, ProxyHeadersMiddleware is not importable.
+    # We skip adding it here; ensure your reverse proxy forwards scheme/host/prefix,
+    # and use APP_ROOT_PATH or PATH_PREFIX as needed. request.base_url will
+    # include root_path when configured on the app.
 
     # Optional TrustedHostMiddleware for additional safety (configurable)
     try:
