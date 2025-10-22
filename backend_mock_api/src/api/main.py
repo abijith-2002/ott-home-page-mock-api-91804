@@ -1,10 +1,14 @@
 from typing import List, Dict
 import os
+import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+
+# Setup module logger
+logger = logging.getLogger("uvicorn.error")
 
 # Determine absolute path to images to avoid CWD-related issues
 # When launched from any working directory, this ensures correct resolution:
@@ -20,10 +24,12 @@ def create_app() -> FastAPI:
     """
     Create and configure the FastAPI application instance.
 
-    - Mounts the static images directory under /media.
+    - Mounts the static images directory under /media (primary).
+    - Adds a compatibility mount under /images to address clients using /images.
     - Adds permissive CORS for local testing.
     - Registers API routes under / and /api/*.
     - Provides OpenAPI docs metadata and tags.
+    - Emits debug logging about the resolved static directory and sample file existence.
 
     Returns:
         FastAPI: Configured FastAPI application.
@@ -39,8 +45,24 @@ def create_app() -> FastAPI:
         ],
     )
 
+    # Diagnostics: log resolved paths
+    logger.info(f"[Static] _THIS_DIR={_THIS_DIR}")
+    logger.info(f"[Static] _BACKEND_ROOT={_BACKEND_ROOT}")
+    logger.info(f"[Static] _IMAGES_DIR={_IMAGES_DIR}")
+    logger.info(f"[Static] images dir exists? {os.path.isdir(_IMAGES_DIR)}")
+    try:
+        sample_list = sorted(os.listdir(_IMAGES_DIR))[:3] if os.path.isdir(_IMAGES_DIR) else []
+    except Exception as e:
+        sample_list = []
+        logger.warning(f"[Static] Could not list images dir: {e}")
+    logger.info(f"[Static] sample files: {sample_list}")
+
     # Mount static images directory using an absolute path for reliability
     app.mount("/media", StaticFiles(directory=_IMAGES_DIR), name="media")
+
+    # Also mount under /images as a compatibility route if clients request /images/*
+    # This addresses persistent 404s when frontend expects '/images'.
+    app.mount("/images", StaticFiles(directory=_IMAGES_DIR), name="images")
 
     # Permissive CORS for local testing
     app.add_middleware(
@@ -72,7 +94,13 @@ def _build_base_url(request: Request) -> str:
         str: Base URL like 'https://domain.tld'
     """
     # request.base_url includes trailing slash; remove it for clean concatenation
-    return str(request.base_url).rstrip("/")
+    base = str(request.base_url).rstrip("/")
+    # Debug log: incoming base url and path
+    try:
+        logger.debug(f"[Request] base_url={base}, url.path={request.url.path}")
+    except Exception:
+        pass
+    return base
 
 
 def _build_items(files: List[tuple], request: Request) -> List[ShowItem]:
@@ -303,7 +331,40 @@ def register_routes(app: FastAPI) -> None:
             FileResponse: The requested image file or 404.
         """
         path = os.path.join(_IMAGES_DIR, filename)
+        logger.debug(f"[Passthrough] Requested filename={filename}, resolved_path={path}")
         if not os.path.isfile(path):
+            logger.warning(f"[Passthrough] File not found: {path}")
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(path)
+
+    # PUBLIC_INTERFACE
+    @app.get(
+        "/images/{filename}",
+        tags=["Media"],
+        summary="Compatibility: Serve image under /images",
+        description="Fallback route to serve images via FileResponse when StaticFiles path mismatch is suspected or clients use /images.",
+        responses={
+            200: {"description": "The image file will be returned"},
+            404: {"description": "File not found"},
+        },
+    )
+    def images_fallback(filename: str):
+        """
+        Fallback FileResponse server for /images/{filename}.
+
+        This provides an explicit route in case StaticFiles mount is mis-resolved by runtime,
+        or if there is an ingress/proxy rewriting issue causing 404s on static mounts.
+
+        Args:
+            filename (str): Image filename to serve.
+
+        Returns:
+            FileResponse: The requested image file, or 404 if missing.
+        """
+        path = os.path.join(_IMAGES_DIR, filename)
+        logger.debug(f"[ImagesFallback] filename={filename}, resolved_path={path}")
+        if not os.path.isfile(path):
+            logger.warning(f"[ImagesFallback] File not found: {path}")
             raise HTTPException(status_code=404, detail="File not found")
         return FileResponse(path)
 
