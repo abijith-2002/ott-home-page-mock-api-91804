@@ -4,6 +4,8 @@ import logging
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -19,6 +21,13 @@ _THIS_DIR = _THIS_FILE.parent
 _BACKEND_ROOT = _THIS_DIR.parents[1]
 _IMAGES_DIR_PATH = _BACKEND_ROOT / "images"
 _IMAGES_DIR = str(_IMAGES_DIR_PATH)
+
+# Environment-driven configuration for proxy/base-path compatibility
+APP_ROOT_PATH = os.getenv("APP_ROOT_PATH", "/").rstrip("/") or "/"
+# Optional: allow preview alias prefix like /backend_mock_api
+PATH_PREFIX = os.getenv("PATH_PREFIX", "").strip()
+# Optional: comma-separated list of allowed hosts (for safety when using proxies)
+TRUSTED_HOSTS = [h.strip() for h in os.getenv("TRUSTED_HOSTS", "*").split(",") if h.strip()] or ["*"]
 
 
 def _safe_listdir(path: str) -> list:
@@ -60,15 +69,22 @@ def create_app() -> FastAPI:
     """
     Create and configure the FastAPI application instance.
 
-    - Mounts the static images directory under /media (primary).
-    - Adds a compatibility mount under /images to address clients using /images.
-    - Adds permissive CORS for local testing.
-    - Registers API routes under / and /api/*.
-    - Provides OpenAPI docs metadata and tags.
-    - Emits debug logging about the resolved static directory and sample file existence.
-    - Exposes diagnostics endpoint to show resolved images_dir and files list.
-    - Adds guaranteed diagnostics at /_health/images and /_debug/images.
-    - Adds passthrough GET /images/{filename:path} with case-insensitive lookup and logging.
+    Proxy and path base support:
+    - Honors X-Forwarded-Proto and X-Forwarded-Prefix via ProxyHeadersMiddleware.
+    - Supports configurable root path via env APP_ROOT_PATH (e.g., "/", "/backend").
+    - Optionally configures TrustedHostMiddleware via TRUSTED_HOSTS env.
+
+    Static files:
+    - Mounts the static images directory under /media (primary) and /images (compat).
+    - Also mounts alias routes under PATH_PREFIX if provided, e.g., /backend_mock_api/media and /backend_mock_api/images.
+    - Adds passthrough routes that respect case-insensitive filenames.
+
+    CORS:
+    - Allows GET from any origin for simple direct image fetching (other methods remain open for local dev).
+
+    Routes:
+    - Registers API routes and diagnostics.
+    - OpenAPI metadata and tags included.
 
     Returns:
         FastAPI: Configured FastAPI application.
@@ -77,6 +93,7 @@ def create_app() -> FastAPI:
         title="OTT Home Page Mock API",
         description="Mock API server that simulates an OTT application's homepage data with dynamic image URLs bound to the request domain.",
         version="1.0.0",
+        root_path=APP_ROOT_PATH,
         openapi_tags=[
             {"name": "Health", "description": "Service status and metadata."},
             {"name": "Media", "description": "Static media files."},
@@ -85,27 +102,46 @@ def create_app() -> FastAPI:
         ],
     )
 
-    # Diagnostics: log resolved paths
+    # Proxy headers: respect X-Forwarded-Proto and X-Forwarded-Prefix from upstream proxy
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+    # Optional TrustedHostMiddleware for additional safety (configurable)
+    try:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
+    except Exception as e:
+        logger.warning(f"[TrustedHostMiddleware] Could not apply trusted hosts {TRUSTED_HOSTS}: {e}")
+
+    # Diagnostics: log resolved paths and config
     logger.info(f"[Static] _THIS_DIR={_THIS_DIR}")
     logger.info(f"[Static] _BACKEND_ROOT={_BACKEND_ROOT}")
     logger.info(f"[Static] _IMAGES_DIR={_IMAGES_DIR}")
     logger.info(f"[Static] images dir exists? {os.path.isdir(_IMAGES_DIR)}")
+    logger.info(f"[Config] APP_ROOT_PATH={APP_ROOT_PATH!r} PATH_PREFIX={PATH_PREFIX!r} TRUSTED_HOSTS={TRUSTED_HOSTS}")
     sample_list = _safe_listdir(_IMAGES_DIR)[:5] if os.path.isdir(_IMAGES_DIR) else []
     logger.info(f"[Static] sample files: {sample_list}")
 
     # Mount static images directory using an absolute path for reliability
-    # Mount at both /media and /images for maximum compatibility with frontends.
-    # Using absolute path ensures consistency across different working directories / process managers.
+    # Primary mounts (root_path aware): accessible at <root_path>/media and <root_path>/images
     app.mount("/media", StaticFiles(directory=_IMAGES_DIR), name="media")
     app.mount("/images", StaticFiles(directory=_IMAGES_DIR), name="images")
 
-    # Permissive CORS for local testing
+    # Optional alias mounts to handle preview prefixes (e.g., /backend_mock_api/images)
+    if PATH_PREFIX:
+        prefix = PATH_PREFIX if PATH_PREFIX.startswith("/") else f"/{PATH_PREFIX}"
+        # Avoid double-mounting if prefix is "/" (no-op)
+        if prefix != "/":
+            app.mount(f"{prefix}/media", StaticFiles(directory=_IMAGES_DIR), name="media_alias")
+            app.mount(f"{prefix}/images", StaticFiles(directory=_IMAGES_DIR), name="images_alias")
+            logger.info(f"[Static] Mounted alias static at {prefix}/media and {prefix}/images")
+
+    # CORS: allow GET from any origin to ensure direct image access works externally
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "OPTIONS"],
         allow_headers=["*"],
+        max_age=600,
     )
 
     register_routes(app)
@@ -120,22 +156,22 @@ class ShowItem(BaseModel):
 
 def _build_base_url(request: Request) -> str:
     """
-    Build a base URL based on the incoming request, ensuring it matches the current host and scheme.
+    Build a base URL based on the incoming request and configured root_path/prefix.
 
-    We avoid forcing any host rewriting (e.g., with X-Forwarded-*), letting the ASGI server / proxy provide
-    the correct base_url. Trailing slash is stripped for clean concatenation.
+    Uses request.base_url (aware of proxy headers) and app.root_path to avoid stripping
+    the path base when generating image URLs.
 
     Args:
         request (Request): The FastAPI request object.
 
     Returns:
-        str: Base URL like 'https://domain.tld'
+        str: Base URL like 'https://domain.tld[/path_base]'
     """
-    # request.base_url includes trailing slash; remove it for clean concatenation
+    # request.base_url includes trailing slash and the app's root_path automatically
+    # when using FastAPI(root_path=...) and ProxyHeadersMiddleware with X-Forwarded-Prefix
     base = str(request.base_url).rstrip("/")
-    # Debug log: incoming base url and path
     try:
-        logger.debug(f"[Request] base_url={base}, url.path={request.url.path}")
+        logger.debug(f"[Request] base_url={base}, url.path={request.url.path}, root_path={getattr(request.app, 'root_path', '')}")
     except Exception:
         pass
     return base
@@ -153,6 +189,7 @@ def _build_items(files: List[tuple], request: Request) -> List[ShowItem]:
         List[ShowItem]: Items with fully qualified poster URLs.
     """
     base = _build_base_url(request)
+    # Use /media under the root_path-aware base
     return [ShowItem(name=name, poster=f"{base}/media/{fname}") for name, fname in files]
 
 
@@ -216,7 +253,6 @@ DATA: Dict[str, List[tuple]] = {
         ("Money Heist", "money_heist.jpg"),
     ],
 }
-
 
 def register_routes(app: FastAPI) -> None:
     """
@@ -433,6 +469,8 @@ def register_routes(app: FastAPI) -> None:
             "files": files[:50],
             "sample_media_url": sample_url,
             "notes": "Static mounts are available at /media and /images.",
+            "root_path": getattr(request.app, "root_path", ""),
+            "path_prefix": PATH_PREFIX,
         }
         return JSONResponse(payload)
 
@@ -465,6 +503,8 @@ def register_routes(app: FastAPI) -> None:
             "images_dir_exists": exists,
             "list_first_50": files[:50],
             "mounted_routes": routes,
+            "root_path": getattr(app, "root_path", ""),
+            "path_prefix": PATH_PREFIX,
         })
 
     # PUBLIC_INTERFACE
@@ -495,6 +535,8 @@ def register_routes(app: FastAPI) -> None:
             "images_dir_exists": exists,
             "list_first_50": files[:50],
             "mounted_routes": routes,
+            "root_path": getattr(app, "root_path", ""),
+            "path_prefix": PATH_PREFIX,
         })
 
 

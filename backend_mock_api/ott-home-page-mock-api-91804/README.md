@@ -18,6 +18,32 @@ Docs: http://localhost:3001/docs
 - The app mounts the local folder: `backend_mock_api/images`
 - Static mounts are configured with an absolute path resolved using `Path(__file__).resolve().parents` from `src/api/main.py`, so it works regardless of current working directory.
 
+## Deployment behind a reverse proxy / path base
+This service supports being deployed under a path base (e.g., `/backend_mock_api`) and behind reverse proxies:
+
+Environment variables:
+- APP_ROOT_PATH: Root path under which the app is served (default "/"). Example: "/backend_mock_api".
+- PATH_PREFIX: Optional additional alias prefix to mount static files under. Example: "/backend_mock_api".
+- TRUSTED_HOSTS: Optional comma-separated hosts for TrustedHostMiddleware. Default "*".
+
+Proxy headers:
+- The app respects `X-Forwarded-Proto` and `X-Forwarded-Prefix` via ProxyHeadersMiddleware, ensuring generated URLs include the correct scheme and path base.
+
+Examples:
+- If APP_ROOT_PATH="/backend_mock_api":
+  - OpenAPI: https://example.com/backend_mock_api/docs
+  - Image:   https://example.com/backend_mock_api/images/stranger_things.jpg
+- If PATH_PREFIX="/backend_mock_api" (alias):
+  - Alias mounts are available at:
+    - https://example.com/backend_mock_api/images/stranger_things.jpg
+    - https://example.com/backend_mock_api/media/stranger_things.jpg
+
+Note:
+- Poster URLs are built from `request.base_url`, which includes `root_path` automatically; this prevents stripping the path base.
+
+## CORS
+CORS is configured to allow GET from any origin so direct image URLs (hotlinks) work externally. Methods: GET, OPTIONS.
+
 ## Guaranteed Diagnostics Endpoints
 These endpoints always return JSON even if static mounts fail:
 - GET `/_health/images` — returns resolved `images_dir`, `exists` flag, first 50 entries, and mounted routes.
@@ -57,6 +83,15 @@ If (2) returns exists=true but (3) returns 404, suspect a proxy/ingress static p
   - http://localhost:3001/_debug/images
   - http://localhost:3001/api/media/debug
 
+## External deployment URL examples
+Assuming APP_ROOT_PATH="/backend_mock_api":
+- Docs:    https://your-domain/backend_mock_api/docs
+- OpenAPI: https://your-domain/backend_mock_api/openapi.json
+- Images:  https://your-domain/backend_mock_api/images/stranger_things.jpg
+- Media:   https://your-domain/backend_mock_api/media/stranger_things.jpg
+
+If using PATH_PREFIX="/backend_mock_api" as an alias, the same URLs above will resolve even when the app root_path is "/".
+
 ## Endpoints
 - GET `/`                      - Health check
 - GET `/api/trending`          - Trending shows
@@ -69,14 +104,14 @@ If (2) returns exists=true but (3) returns 404, suspect a proxy/ingress static p
 
 All endpoints return an array of objects:
 [
-  { "name": "Show Name", "poster": "https://<your-host>/media/<file>.jpg" }
+  { "name": "Show Name", "poster": "https://<your-host>[/path-base]/media/<file>.jpg" }
 ]
 
 ## Example curl
 curl -s http://localhost:3001/api/trending | jq
 
 ## Notes
-- CORS is permissive for local testing.
-- Poster URLs use the request's scheme and host to avoid hard-coding domains. We strip trailing slash from `request.base_url` to ensure correct concatenation (`https://host/media/file.jpg`).
+- CORS allows GET from any origin for images.
+- Poster URLs use request.base_url which already includes the root path and correct scheme/host based on proxy headers.
 - The OpenAPI documentation includes tags and response models for clarity.
 - Primary route is `/media/{filename}` and images live in `backend_mock_api/images`. For compatibility, `/images/{filename}` (static) and `GET /images/{filename}` (passthrough) are also available.
